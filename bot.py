@@ -1,5 +1,7 @@
 import os
+import io
 import asyncio
+import tempfile
 import discord
 from discord.ext import commands
 from discord.sinks import WaveSink
@@ -15,24 +17,22 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 client_ai = OpenAI(api_key=OPENAI_API_KEY)
 
-# ---------- Transcrição (síncrona; rodamos em thread) ----------
+# ---------- Transcrição ----------
 def transcrever_arquivo(path: str) -> str:
+    # roda em thread via asyncio.to_thread
     with open(path, "rb") as f:
         r = client_ai.audio.transcriptions.create(
-            model="whisper-1",  # ou "gpt-4o-mini-transcribe" se preferir
+            model="whisper-1",  # ou "gpt-4o-mini-transcribe"
             file=f
         )
     return r.text
 
-# ---------- Eventos ----------
 @bot.event
 async def on_ready():
     print(f"✅ Logado como {bot.user}")
 
-# ---------- Comandos util ----------
 @bot.command()
 async def entrar(ctx):
-    """Entra no canal de voz do autor."""
     if ctx.author.voice is None:
         return await ctx.send("❌ Você precisa estar em um canal de voz.")
     if ctx.voice_client:
@@ -42,14 +42,12 @@ async def entrar(ctx):
 
 @bot.command()
 async def sair(ctx):
-    """Sai do canal de voz atual."""
     if ctx.voice_client:
         await ctx.voice_client.disconnect()
         await ctx.send("👋 Saí do canal de voz.")
     else:
         await ctx.send("❌ Não estou em um canal.")
 
-# ---------- Gravação controlada ----------
 @bot.command()
 async def gravar(ctx):
     """Inicia a gravação até usar !parar."""
@@ -59,37 +57,29 @@ async def gravar(ctx):
             return await ctx.send("❌ Você precisa estar em um canal de voz.")
         vc = await ctx.author.voice.channel.connect()
 
-    try:
-        if getattr(vc, "is_recording", lambda: False)():
-            return await ctx.send("⚠️ Já estou gravando.")
+    if getattr(vc, "is_recording", lambda: False)():
+        return await ctx.send("⚠️ Já estou gravando.")
 
-        sink = WaveSink()
+    sink = WaveSink()
 
-        # callback síncrono: agenda a corrotina no loop do bot
-        def finished_callback(sink_obj, ctx_arg):
-            asyncio.run_coroutine_threadsafe(
-                processar_gravacao(ctx_arg, sink_obj),
-                bot.loop
-            )
+    # py-cord 2.6.x espera callback ASSÍNCRONO
+    async def finished_callback(sink_obj, ctx_arg):
+        await processar_gravacao(ctx_arg, sink_obj)
 
-        vc.start_recording(sink, finished_callback, ctx)
-        await ctx.send("⏺️ Gravando... use **!parar** para finalizar.")
-    except Exception as e:
-        await ctx.send(f"⚠️ Erro ao iniciar gravação: {e}")
+    vc.start_recording(sink, finished_callback, ctx)
+    await ctx.send("⏺️ Gravando... use **!parar** para finalizar.")
 
 @bot.command()
 async def parar(ctx):
-    """Para a gravação e inicia a transcrição."""
     vc = ctx.voice_client
     if not vc or not getattr(vc, "is_recording", lambda: False)():
         return await ctx.send("❌ Não estou gravando.")
     vc.stop_recording()
     await ctx.send("🛑 Parando a gravação...")
 
-# ---------- Gravação rápida de 10s ----------
 @bot.command(name="gravar10")
 async def gravar10(ctx):
-    """Grava 10 segundos e transcreve."""
+    """Grava 10s e transcreve."""
     vc = ctx.voice_client
     if not vc:
         if ctx.author.voice is None:
@@ -98,25 +88,42 @@ async def gravar10(ctx):
 
     sink = WaveSink()
 
-    def finished_callback(sink_obj, ctx_arg):
-        asyncio.run_coroutine_threadsafe(
-            processar_gravacao(ctx_arg, sink_obj),
-            bot.loop
-        )
+    async def finished_callback(sink_obj, ctx_arg):
+        await processar_gravacao(ctx_arg, sink_obj)
 
     vc.start_recording(sink, finished_callback, ctx)
     await ctx.send("⏺️ Gravando por **10s**...")
     await asyncio.sleep(10)
     vc.stop_recording()
 
-# ---------- Processa a gravação (transcreve e envia) ----------
+# ---------- Processamento / Transcrição ----------
 async def processar_gravacao(ctx: commands.Context, sink: WaveSink):
     await ctx.send("🔄 Processando áudio...")
 
     partes = []
-    # sink.audio_data: dict {Member -> AudioData}
+    # sink.audio_data: {Member -> AudioData}; AudioData.file é BytesIO
     for user, audio in sink.audio_data.items():
-        caminho = audio.file  # arquivo WAV temporário
+        file_like = audio.file  # BytesIO
+        if not isinstance(file_like, (io.BytesIO, io.BufferedReader)):
+            # fallback raro: já veio caminho
+            caminho = str(file_like)
+        else:
+            # grava BytesIO em arquivo temporário .wav
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+                tmp.write(file_like.getbuffer())
+                caminho = tmp.name
+
+        # ignora arquivos vazios/corrompidos
+        try:
+            if not os.path.exists(caminho) or os.path.getsize(caminho) < 1024:
+                try:
+                    os.remove(caminho)
+                except Exception:
+                    pass
+                continue
+        except Exception:
+            pass
+
         try:
             texto = await asyncio.to_thread(transcrever_arquivo, caminho)
             partes.append(f"**{getattr(user, 'display_name', str(user))}:** {texto}")
