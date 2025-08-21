@@ -4,16 +4,18 @@ import discord
 from discord.ext import commands
 from openai import OpenAI
 
+# tokens do ambiente
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
+# intents
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 client_ai = OpenAI(api_key=OPENAI_API_KEY)
 
-# --- Função para transcrever ---
-async def transcrever_arquivo(path: str) -> str:
+# --- Função de transcrição (agora síncrona) ---
+def transcrever_arquivo(path: str) -> str:
     with open(path, "rb") as f:
         r = client_ai.audio.transcriptions.create(
             model="whisper-1",
@@ -21,12 +23,11 @@ async def transcrever_arquivo(path: str) -> str:
         )
     return r.text
 
-# --- Evento ready ---
+# --- Eventos e comandos ---
 @bot.event
 async def on_ready():
     print(f"✅ Logado como {bot.user}")
 
-# --- Comandos básicos ---
 @bot.command()
 async def ping(ctx):
     await ctx.send("Pong!")
@@ -47,38 +48,25 @@ async def sair(ctx):
     await ctx.voice_client.disconnect()
     await ctx.send("👋 Saí do canal de voz.")
 
-# --- Gravação com a API nova ---
 @bot.command()
-async def gravar(ctx, segundos: int = 30):
+async def gravar(ctx, segundos: int = 60):
     vc: discord.VoiceClient = ctx.voice_client
     if vc is None:
         return await ctx.send("Eu preciso estar em um canal de voz. Use !entrar.")
 
     await ctx.send(f"⏺️ Gravando por {segundos}s...")
 
-    # Função callback chamada quando acabar a gravação
-    def finished_callback(sink, *args):
-        asyncio.run_coroutine_threadsafe(processar_gravacao(ctx, sink), bot.loop)
+    sink = discord.sinks.WaveSink()  # grava cada usuário em wav
+    recordings = await discord.sinks.record(vc, sink, timeout=segundos)
 
-    # Inicia gravação
-    vc.start_recording(
-        discord.sinks.WaveSink(),  # grava em wav
-        finished_callback,
-        ctx
-    )
-
-    # Para depois de X segundos
-    await asyncio.sleep(segundos)
-    vc.stop_recording()
-
-async def processar_gravacao(ctx, sink: discord.sinks.Sink):
     await ctx.send("🛑 Gravação finalizada. Transcrevendo...")
 
     partes = []
-    for user, arquivos in sink.audio_data.items():
-        for audio in arquivos:
-            caminho = audio.file
+    for user, files in recordings.items():
+        for a in files:
+            caminho = a.file
             try:
+                # chama função síncrona em thread separada
                 texto = await asyncio.to_thread(transcrever_arquivo, caminho)
                 partes.append(f"**{user.display_name}:** {texto}")
             except Exception as e:
@@ -95,4 +83,5 @@ async def processar_gravacao(ctx, sink: discord.sinks.Sink):
             f.write(saida)
         await ctx.send("📝 **Transcrição da daily (arquivo)**", file=discord.File("transcricao.txt"))
 
+# run
 bot.run(DISCORD_TOKEN)
