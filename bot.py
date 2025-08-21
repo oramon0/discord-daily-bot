@@ -1,87 +1,70 @@
-import os
-import asyncio
 import discord
 from discord.ext import commands
-from openai import OpenAI
+from discord.sinks import WaveSink
+import asyncio
+import os
+import openai
 
-# tokens do ambiente
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+# Configurações
+TOKEN = os.getenv("DISCORD_TOKEN")   # seu token do bot
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# intents
+openai.api_key = OPENAI_API_KEY
 intents = discord.Intents.default()
 intents.message_content = True
+intents.voice_states = True
+
 bot = commands.Bot(command_prefix="!", intents=intents)
-client_ai = OpenAI(api_key=OPENAI_API_KEY)
 
-# --- Função de transcrição (agora síncrona) ---
-def transcrever_arquivo(path: str) -> str:
-    with open(path, "rb") as f:
-        r = client_ai.audio.transcriptions.create(
-            model="whisper-1",
-            file=f
-        )
-    return r.text
-
-# --- Eventos e comandos ---
 @bot.event
 async def on_ready():
     print(f"✅ Logado como {bot.user}")
 
 @bot.command()
-async def ping(ctx):
-    await ctx.send("Pong!")
-
-@bot.command()
-async def entrar(ctx):
+async def gravar(ctx, segundos: int = 10):
     if ctx.author.voice is None:
-        return await ctx.send("Entre em um canal de voz primeiro.")
-    if ctx.voice_client is not None:
-        return await ctx.send("Já estou em um canal de voz.")
-    await ctx.author.voice.channel.connect()
-    await ctx.send("🎙️ Entrei no canal de voz.")
+        await ctx.send("❌ Você precisa estar em um canal de voz.")
+        return
 
-@bot.command()
-async def sair(ctx):
-    if ctx.voice_client is None:
-        return await ctx.send("Não estou em um canal de voz.")
-    await ctx.voice_client.disconnect()
-    await ctx.send("👋 Saí do canal de voz.")
+    vc = await ctx.author.voice.channel.connect()
+    sink = WaveSink()
 
-@bot.command()
-async def gravar(ctx, segundos: int = 60):
-    vc: discord.VoiceClient = ctx.voice_client
-    if vc is None:
-        return await ctx.send("Eu preciso estar em um canal de voz. Use !entrar.")
+    async def finished_callback(sink, *args):
+        text_final = ""
+        for user_id, audio in sink.audio_data.items():
+            filename = f"record_{user_id}.wav"
+            with open(filename, "wb") as f:
+                f.write(audio.file.getbuffer())
 
-    await ctx.send(f"⏺️ Gravando por {segundos}s...")
-
-    sink = discord.sinks.WaveSink()  # grava cada usuário em wav
-    recordings = await discord.sinks.record(vc, sink, timeout=segundos)
-
-    await ctx.send("🛑 Gravação finalizada. Transcrevendo...")
-
-    partes = []
-    for user, files in recordings.items():
-        for a in files:
-            caminho = a.file
+            # --- Transcrevendo com Whisper ---
             try:
-                # chama função síncrona em thread separada
-                texto = await asyncio.to_thread(transcrever_arquivo, caminho)
-                partes.append(f"**{user.display_name}:** {texto}")
+                with open(filename, "rb") as audio_file:
+                    transcript = openai.audio.transcriptions.create(
+                        model="gpt-4o-mini-transcribe",
+                        file=audio_file
+                    )
+                text_final += f"🗣 <@{user_id}>: {transcript.text}\n"
             except Exception as e:
-                partes.append(f"**{user.display_name}:** [erro: {e}]")
+                text_final += f"⚠️ Erro ao transcrever áudio de <@{user_id}>: {e}\n"
 
-    if not partes:
-        return await ctx.send("Não capturei áudio suficiente.")
+            # remove arquivo depois de usar
+            os.remove(filename)
 
-    saida = "\n".join(partes)
-    if len(saida) < 1800:
-        await ctx.send(f"📝 **Transcrição da daily**\n{saida}")
-    else:
-        with open("transcricao.txt", "w", encoding="utf-8") as f:
-            f.write(saida)
-        await ctx.send("📝 **Transcrição da daily (arquivo)**", file=discord.File("transcricao.txt"))
+        if text_final.strip() == "":
+            text_final = "⚠️ Não consegui transcrever nada."
+        await ctx.send(text_final)
 
-# run
-bot.run(DISCORD_TOKEN)
+        # desconectar no final
+        await vc.disconnect()
+
+    vc.start_recording(
+        sink,
+        finished_callback,
+        ctx.channel
+    )
+
+    await ctx.send(f"🎙 Gravando por {segundos}s...")
+    await asyncio.sleep(segundos)
+    vc.stop_recording()
+
+bot.run(TOKEN)
